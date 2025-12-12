@@ -51,6 +51,11 @@ class JournalExperimentNode(Node):
         self.timeout = 60.0
         self.error_thres_deg = 5.0
 
+        # statistics
+        self.success_count = 0
+        self.timeout_count = 0
+        self.completion_times = []
+
         # buffers
         self.t_last_reset = -1
         self.reset_buffers()
@@ -270,11 +275,30 @@ class JournalExperimentNode(Node):
         self.is_manipulating = True
 
     def reset_so3_target(self, quat_target):
+        self.curr_quat_target[:] = quat_target  # 保存目标用于检测完成
         request = SetParameters.Request()
         request.parameters = [
             Parameter(name='rand_so3_target', value=ParameterValue(double_array_value=quat_target.tolist(), type=ParameterType.PARAMETER_DOUBLE_ARRAY))
         ]
-        self.high_level_param_client.call_async(request)
+        future = self.high_level_param_client.call_async(request)
+
+    def check_task_completion(self):
+        """检查是否达到目标SO3"""
+        # 归一化四元数
+        q_curr = self.curr_quat / np.linalg.norm(self.curr_quat)
+        q_target = self.curr_quat_target / np.linalg.norm(self.curr_quat_target)
+        
+        # 四元数点积（考虑双重覆盖，取绝对值）
+        dot_product = np.abs(np.dot(q_curr, q_target))
+        dot_product = np.clip(dot_product, 0.0, 1.0)
+        
+        # 计算角度误差（弧度→度）
+        angle_error_rad = 2 * np.arccos(dot_product)
+        angle_error_deg = np.rad2deg(angle_error_rad)
+        
+        # 判断是否完成
+        is_completed = angle_error_deg < self.error_thres_deg
+        return is_completed, angle_error_deg
 
     def post_task_process(self):
         high_freq = 1 / np.mean(self.dt_recv_traj)
@@ -305,21 +329,73 @@ class JournalExperimentNode(Node):
         self.is_resetting = True
         # ----------------------------------------
         t_now = self.get_ros_time()
-        if self.is_manipulating and t_now - self.t_last_reset > self.timeout:
-            self.current_goal_id += 1
-            self.get_logger().info(f'Timeout for goal {self.current_goal_id}! Resetting...')
+        
+        if self.is_manipulating:
+            elapsed_time = t_now - self.t_last_reset
             
-            if self.current_goal_id >= len(self.rand_so3_data) - 1:
-                self.post_task_process()
-                self.get_logger().info('All goals are done!')
-                self.destroy_node()
-                rclpy.shutdown()
-            else:
-                self.reset_task()
-                self.post_task_process()
-                self.start_task()
+            # 检查任务完成
+            is_completed, angle_error = self.check_task_completion()
+            
+            if is_completed:
+                # 任务成功完成
+                self.success_count += 1
+                self.completion_times.append(elapsed_time)
+                self.current_goal_id += 1
+                self.get_logger().info(
+                    f'✓ Goal {self.current_goal_id} completed! '
+                    f'Time: {elapsed_time:.2f}s, Error: {angle_error:.2f}°'
+                )
+                
+                if self.current_goal_id >= len(self.rand_so3_data) - 1:
+                    self.post_task_process()
+                    self.print_statistics()
+                    self.get_logger().info('All goals are done!')
+                    self.destroy_node()
+                    rclpy.shutdown()
+                else:
+                    self.post_task_process()
+                    self.reset_task()
+                    self.start_task()
+                    
+            elif elapsed_time > self.timeout:
+                # 任务超时失败
+                self.timeout_count += 1
+                self.current_goal_id += 1
+                self.get_logger().warn(
+                    f'✗ Goal {self.current_goal_id} timeout! '
+                    f'Final error: {angle_error:.2f}°'
+                )
+                
+                if self.current_goal_id >= len(self.rand_so3_data) - 1:
+                    self.post_task_process()
+                    self.print_statistics()
+                    self.get_logger().info('All goals are done!')
+                    self.destroy_node()
+                    rclpy.shutdown()
+                else:
+                    self.post_task_process()
+                    self.reset_task()
+                    self.start_task()
         # ----------------------------------------
         self.is_resetting = False
+    
+    def print_statistics(self):
+        """打印任务统计信息"""
+        total_tasks = self.success_count + self.timeout_count
+        success_rate = 100.0 * self.success_count / total_tasks if total_tasks > 0 else 0.0
+        avg_time = np.mean(self.completion_times) if len(self.completion_times) > 0 else 0.0
+        
+        self.get_logger().info('\n' + '='*50)
+        self.get_logger().info('TASK STATISTICS')
+        self.get_logger().info('='*50)
+        self.get_logger().info(f'Total tasks: {total_tasks}')
+        self.get_logger().info(f'Successful: {self.success_count}')
+        self.get_logger().info(f'Timeout: {self.timeout_count}')
+        self.get_logger().info(f'Success rate: {success_rate:.1f}%')
+        if len(self.completion_times) > 0:
+            self.get_logger().info(f'Avg completion time: {avg_time:.2f}s')
+            self.get_logger().info(f'Min/Max time: {np.min(self.completion_times):.2f}s / {np.max(self.completion_times):.2f}s')
+        self.get_logger().info('='*50 + '\n')
             
 
 def main(args=None):
