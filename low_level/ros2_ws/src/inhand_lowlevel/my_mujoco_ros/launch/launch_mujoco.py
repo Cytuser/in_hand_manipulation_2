@@ -92,15 +92,15 @@ def generate_launch_description():
             output="screen",
         ),
 
-        Node(
-            package="rviz2",
-            executable="rviz2",
-            name="rviz2",
-            parameters=[
-                {"robot_description": robot_description_config.toxml()}],
-            arguments=["-d", rviz_config],
-            output="screen",
-        )
+        # Node(
+        #     package="rviz2",
+        #     executable="rviz2",
+        #     name="rviz2",
+        #     parameters=[
+        #         {"robot_description": robot_description_config.toxml()}],
+        #     arguments=["-d", rviz_config],
+        #     output="screen",
+        # )
     ])
 
 if __name__ == '__main__':

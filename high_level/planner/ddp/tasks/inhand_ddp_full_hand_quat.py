@@ -159,8 +159,8 @@ class QSimDDPParams(object):
         self.T_ctrl = 10            # 20
         
         self.x0 = np.array([
-            1, 0, 0, 0,                 # ball
-            # 0.1368093, 0.58294937, 0.21369098, -0.77187396,
+            #1, 0, 0, 0,                 # ball
+            0.1368093, 0.58294937, 0.21369098, -0.77187396,
             0.2, 0.95, 1.0, 1.0,                # index finger
             0.0, 0.6, 1.0, 1.0,                 # middle finger
             -0.2, 0.95, 1.0, 1.0,               # ring finger
@@ -218,7 +218,44 @@ class QSimDDPParams(object):
         
         self.w_xreg = 1
         self.w_ureg = 0.04
+class SuccessChecker:
+    def __init__(self, threshold_deg=3.0, hold_steps=10):
+        """
+        Args:
+            threshold_deg: 允许的最大角度误差 (度)
+            hold_steps: 需要连续保持多少步才算成功 (例如 10步 = 1秒 @ 10Hz)
+        """
+        self.threshold_deg = threshold_deg
+        self.hold_steps = hold_steps
+        self.counter = 0
+        
+    def update(self, x_current, target_quat):
+        start_quat = Quaternion(x_current[0:4])
+        dq = start_quat.inverse().multiply(target_quat)
+        angle_axis = RotationMatrix(dq).ToAngleAxis()
 
+        angle_ = angle_axis.angle()
+        """
+        更新成功检查器状态
+        
+        Args:
+            x_current: 当前状态，前4维是四元数 (w,x,y,z)
+            x_target: 目标状态，前4维是四元数 (w,x,y,z)
+            
+        Returns:
+            (is_success, error_deg, counter): 是否成功、误差角度、连续成功计数
+        """
+        error_deg = angle_
+        
+        # 计数器逻辑
+        if error_deg < self.threshold_deg:
+            self.counter += 1
+        else:
+            self.counter = 0  # 一旦超出，重置计数
+            
+        is_success = self.counter >= self.hold_steps
+        
+        return is_success, error_deg, self.counter
 
 class ReferenceGeneratorRPY(object):
     """
@@ -817,6 +854,7 @@ def solve_ddp_mpc_problem(
             - x0, x_ref
             - x_init, u_init
     """
+    success_checker = SuccessChecker(threshold_deg=0.1, hold_steps=5)
     T = options.T_ctrl
     x0 = options.x0
 
@@ -838,7 +876,15 @@ def solve_ddp_mpc_problem(
         x_ref_i = np.zeros((T+1, options.nx))
         x_ref_i[:, 0:4] = ref_gen.generate_reference_from_x0(x0[0:4])
         x_ref_i[:, 4:] = options.xa_reg
+        # print("###### target ######: ", ref_gen.target)
+        done, err_deg, hold_cnt = success_checker.update(x0, ref_gen.target)
+        # # print("--------------- target -----------------",options.target)
+        print(f"[Check] Error: {err_deg:.4f} deg | Hold: {hold_cnt}/{success_checker.hold_steps}")
 
+        if done:
+            print(f"\n========== TASK COMPLETED at Step {i} ==========")
+            print(f"Final Error: {err_deg:.4f} deg")
+            print("================================================")
         # # debug
         # if i > 350:
         #     q_vis.publish_trajectory(
