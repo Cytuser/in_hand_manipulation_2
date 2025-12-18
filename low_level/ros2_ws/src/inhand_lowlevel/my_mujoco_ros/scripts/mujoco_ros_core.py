@@ -18,6 +18,13 @@ from my_mujoco_ros.utils import get_contact_message, transform_pos_quat
 import mujoco
 from mujoco import viewer
 
+def skew_matrix(v):
+    """Generate skew-symmetric matrix"""
+    return np.array([
+        [0, -v[2], v[1]],
+        [v[2], 0, -v[0]],
+        [-v[1], v[0], 0]
+    ])
 
 def get_force_vis_message(force, position, marker_id=0):
     marker = Marker()
@@ -171,6 +178,7 @@ class MuJoCoSimulatorNode(Node):
 
         self.object_body_indice = object_body_indice
 
+        self.manipulability_m_pub = self.create_publisher(Float64MultiArray, '/manipulability_m', 10)
         # Parse finger contacts
         # geom -> the contact geometry
         # site -> the contact force/point will be represented in site
@@ -366,6 +374,7 @@ class MuJoCoSimulatorNode(Node):
         object_state_msg.header.stamp = self.get_clock().now().to_msg()
 
         mjpc_object_state = Float64MultiArray()
+        self.compute_and_publish_manipulability_m()
 
         if self.is_mjpc:
             qpos = self.data.qpos[self.obj_qpos_indices]
@@ -542,6 +551,82 @@ class MuJoCoSimulatorNode(Node):
 
         self.contact_state_pub.publish(contact_info_msg)
 
+
+    def compute_and_publish_manipulability_m(self):
+        """
+        计算并发布可操作性椭球核心矩阵 M = J_rot @ J_rot.T
+        其中 J_rot 是从关节速度到球体角速度的映射
+        """
+        try:
+            # 1. 获取基础数据
+            # ---------------------------------------------------------
+            obj_pos = self.data.xpos[self.object_body_indice] # 球心位置
+            # print(f"obj_pos: {obj_pos}")
+            nc = len(self.contact_geom_ids) # 接触点数量
+            # print(f"nc: {nc}")
+            if nc == 0: return
+
+            # # 手部关节数量 (从 qvel_indices 获取)
+            nv_hand = len(self.qvel_indices) 
+            # print(f"nv_hand: {nv_hand}")
+            # # 2. 初始化矩阵 (HF模型: 每个接触点 3 行约束)
+            # # ---------------------------------------------------------
+            # # G_rot_T: (3*nc, 3) -> 球体角速度 w_obj 到 接触点线速度 v_c 的映射
+            G_rot_T = np.zeros((3 * nc, 3))
+            # # J_hand:  (3*nc, nv_hand) -> 关节速度 dq 到 接触点线速度 v_c 的映射
+            J_hand = np.zeros((3 * nc, nv_hand))
+            
+            # # 临时缓冲区
+            jacp = np.zeros((3, self.model.nv)) # 线速度雅可比
+            jacr = np.zeros((3, self.model.nv)) # 角速度雅可比 (忽略)
+
+            # # 3. 填充 G 和 J
+            # # ---------------------------------------------------------
+            for i, site_id in enumerate(self.contact_site_ids):
+                # 获取接触点位置
+                site_pos = self.data.site_xpos[site_id]
+                # print(f"site_pos: {site_pos}")
+                # A. 填充 G_rot_T
+                # 公式: v_c = v_obj + w_obj x r
+                # 固定球体 v_obj=0, r = p_contact - p_center
+                # v_c = -r x w_obj = -skew(r) * w_obj
+                r = site_pos - obj_pos
+                
+                row_start = 3 * i
+                row_end = 3 * i + 3
+                
+                G_rot_T[row_start:row_end, :] = -skew_matrix(r)
+                
+                # B. 填充 J_hand
+                mujoco.mj_jacSite(self.model, self.data, jacp, jacr, site_id)
+                # 切片提取手部关节部分
+                J_hand[row_start:row_end, :] = jacp[:, self.qvel_indices]
+
+            # 4. 计算合成雅可比 J_rot
+            # ---------------------------------------------------------
+            # 关系: G_rot_T * w_obj = J_hand * dq
+            # w_obj = pinv(G_rot_T) * J_hand * dq
+            # J_rot = pinv(G_rot_T) * J_hand
+            
+            # 使用伪逆求解 (处理接触点不足或奇异情况)
+            G_pinv = np.linalg.pinv(G_rot_T)
+            J_rot = G_pinv @ J_hand # 形状 (3, nv_hand)
+
+            # 5. 计算核心矩阵 M
+            # ---------------------------------------------------------
+            # M = J J^T (3x3 对称矩阵)
+            M = J_rot @ J_rot.T
+            # print(f"M: {M}")
+            # 6. 发布消息
+            # ---------------------------------------------------------
+            msg = Float64MultiArray()
+            # 展平为 9 个元素的数组发布
+            msg.data = M.flatten().tolist()
+            self.manipulability_m_pub.publish(msg)
+
+        except Exception as e:
+            # self.get_logger().warn(f"Failed to compute M: {e}")
+            pass
     def set_desired_joint_pos_callback(self, msg:JointState):
         def get_jnt_remap(rec_jnt, des_jnt):
             """ Get the mapping from rec_jnt to des_jnt """

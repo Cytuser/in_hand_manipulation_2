@@ -230,7 +230,9 @@ class SuccessChecker:
         self.counter = 0
         
     def update(self, x_current, target_quat):
+        # print(f"x_current: {x_current[0:4]}")
         start_quat = Quaternion(x_current[0:4])
+        # print(f"start_quat: {start_quat}")
         dq = start_quat.inverse().multiply(target_quat)
         angle_axis = RotationMatrix(dq).ToAngleAxis()
 

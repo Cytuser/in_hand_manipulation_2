@@ -280,7 +280,7 @@ class LowlevelControllerHw(Node):
         # run contact control once hardware states are received
         self.contact_controller_callback()
 
-        if len(self.remapping_to_hw) == 16:
+        if len(self.remapping_to_hw) == 16 and self.high_level_traj is not None:
             t_now = time_msg_to_float(msg.header.stamp)
             self.logger.update_q_read(self.hardware_state.get_q_actuated(), t_now, self.remapping_to_hw)
             self.logger.update_obj_state(self.hardware_state.get_q_unactuated(), t_now)
