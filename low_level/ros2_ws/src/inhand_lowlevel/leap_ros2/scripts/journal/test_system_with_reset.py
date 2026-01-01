@@ -50,7 +50,7 @@ class JournalExperimentNode(Node):
 
         # preparation
         self.rand_so3_data = np.load('./data/quat_targets-250318.npy')
-        self.rand_so3_data = self.rand_so3_data[0:10]
+        self.rand_so3_data = self.rand_so3_data[0:5]
         if test_method in ['mjpc']:
             # rotate the goal w.r.t. z-axis np.pi
             for i in range(len(self.rand_so3_data)):
@@ -388,64 +388,116 @@ class JournalExperimentNode(Node):
         # 判断是否完成
         is_completed = angle_degrees < self.error_thres_deg
         return is_completed, angle_degrees
-    
+
     def compute_tci(self, M, obj_quat, target_quat, mode='velocity'):
         """
-        计算 Transmission Capability Index (TCI)
-        
         Args:
-            M: 3x3 可操作性矩阵
-            obj_quat: 当前四元数 [w, x, y, z]
-            target_quat: 目标四元数 [w, x, y, z]
+            M: 3x3 可操作性矩阵 (论文中的 J @ J.T)
+            obj_quat: 当前姿态 [w, x, y, z]
+            target_quat: 目标姿态 [w, x, y, z]
             mode: 'velocity' 或 'torque'
         
         Returns:
-            tci: TCI 值 (0~1)
+            c: Compatibility Index (标量，值越大越好)
         """
-        # MuJoCo quat is [w, x, y, z], Scipy is [x, y, z, w]
+        # 1. 计算任务方向向量 u (Task Direction Vector)
+        # -----------------------------------------------------------
+        # 使用 Scipy 处理四元数差异，找到旋转轴
         r_curr = SciR.from_quat([obj_quat[1], obj_quat[2], obj_quat[3], obj_quat[0]])
         r_targ = SciR.from_quat([target_quat[1], target_quat[2], target_quat[3], target_quat[0]])
         
-        # 计算相对旋转: R_err = R_targ * R_curr.T
+        # 计算误差旋转: R_err = R_targ * R_curr_inv
         r_err = r_targ * r_curr.inv()
-        rot_vec = r_err.as_rotvec()  # 旋转向量 (轴 * 角度)
+        rot_vec = r_err.as_rotvec() 
         
         norm = np.linalg.norm(rot_vec)
-        if norm < 1e-6:
-            # 误差极小时，返回最优 TCI (1.0)
-            return 1.0
-        else:
-            u = rot_vec / norm  # 单位方向向量
         
-        tci = 0.0
+        # 如果已经到达目标 (误差极小)，此时 u 无定义，
+        # 但通常意味着任务完成，可以返回一个表示“保持”的高值或 0
+        if norm < 1e-6:
+            return 0.0 
+            
+        u = rot_vec / norm  # 单位向量 u (论文中的 u)
+        
+        c = 0.0
         try:
+            # 2. 根据 Chiu Eq. 8 计算指数 c
+            # -----------------------------------------------------------
+            # 论文中 M = JJ^T (对应代码中的 M)
+            # 论文定义速度椭球矩阵为 (JJ^T)^-1 
+            
             if mode == 'velocity':
-                # 速度传输比: 1 / sqrt(u^T M^-1 u)
-                # 我们希望最大化它
                 M_inv = np.linalg.inv(M)
                 term = u.T @ M_inv @ u
-                transmission = 1.0 / np.sqrt(term)
-                
-                # 归一化: 除以椭球最大轴长
-                eigvals = np.linalg.eigvalsh(M)
-                max_transmission = np.sqrt(np.max(eigvals))
-                tci = transmission / (max_transmission + 1e-9)
-                
+                c = 1.0 / (term + 1e-9)
+
             elif mode == 'torque':
-                # 力矩传输比: sqrt(u^T M u)
+                
                 term = u.T @ M @ u
-                transmission = np.sqrt(term)
-                
-                # 归一化: 除以椭球最大轴长
-                eigvals = np.linalg.eigvalsh(M)
-                max_transmission = np.sqrt(np.max(eigvals))
-                tci = transmission / (max_transmission + 1e-9)
-                
-        except Exception as e:
-            # 计算失败时返回 0
-            tci = 0.0
+                c = 1.0 / (term + 1e-9)
+
+        except np.linalg.LinAlgError:
+            c = 0.0
+            
+        return c
+    
+    # def compute_tci(self, M, obj_quat, target_quat, mode='velocity'):
+    #     """
+    #     计算 Transmission Capability Index (TCI)
         
-        return np.clip(tci, 0.0, 1.0)
+    #     Args:
+    #         M: 3x3 可操作性矩阵
+    #         obj_quat: 当前四元数 [w, x, y, z]
+    #         target_quat: 目标四元数 [w, x, y, z]
+    #         mode: 'velocity' 或 'torque'
+        
+    #     Returns:
+    #         tci: TCI 值 (0~1)
+    #     """
+    #     # MuJoCo quat is [w, x, y, z], Scipy is [x, y, z, w]
+    #     r_curr = SciR.from_quat([obj_quat[1], obj_quat[2], obj_quat[3], obj_quat[0]])
+    #     r_targ = SciR.from_quat([target_quat[1], target_quat[2], target_quat[3], target_quat[0]])
+        
+    #     # 计算相对旋转: R_err = R_targ * R_curr.T
+    #     r_err = r_targ * r_curr.inv()
+    #     rot_vec = r_err.as_rotvec()  # 旋转向量 (轴 * 角度)
+        
+    #     norm = np.linalg.norm(rot_vec)
+    #     if norm < 1e-6:
+    #         # 误差极小时，返回最优 TCI (1.0)
+    #         return 1.0
+    #     else:
+    #         u = rot_vec / norm  # 单位方向向量
+        
+    #     tci = 0.0
+    #     try:
+    #         if mode == 'velocity':
+    #             # 速度传输比: 1 / sqrt(u^T M^-1 u)
+    #             # 我们希望最大化它
+    #             M_inv = np.linalg.inv(M)
+    #             term = u.T @ M_inv @ u
+    #             transmission = 1.0 / np.sqrt(term)
+                
+    #             # 归一化: 除以椭球最大轴长
+    #             eigvals = np.linalg.eigvalsh(M)
+    #             max_transmission = np.sqrt(np.max(eigvals))
+    #             tci = transmission / (max_transmission + 1e-9)
+                
+    #         elif mode == 'torque':
+    #             # 力矩传输比: sqrt(u^T M u)
+    #             term = u.T @ M @ u
+    #             transmission = np.sqrt(term)
+                
+    #             # 归一化: 除以椭球最大轴长
+    #             eigvals = np.linalg.eigvalsh(M)
+    #             max_transmission = np.sqrt(np.max(eigvals))
+    #             tci = transmission / (max_transmission + 1e-9)
+                
+    #     except Exception as e:
+    #         # 计算失败时返回 0
+    #         tci = 0.0
+        
+    #     return np.clip(tci, 0.0, 1.0)
 
     def post_task_process(self):
         high_freq = 1 / np.mean(self.dt_recv_traj) if len(self.dt_recv_traj) > 0 else 0.0

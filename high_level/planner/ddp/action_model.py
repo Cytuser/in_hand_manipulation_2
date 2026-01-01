@@ -9,7 +9,6 @@ from common.common_ddp import (
     delete_listb_from_lista,
 )
 
-
 class QuasistaticActionModel(crocoddyl.ActionModelAbstract):
     def __init__(self, q_sim, sim_params, state, actuation, defaultCostModel, extras=None):
         crocoddyl.ActionModelAbstract.__init__(self, state, actuation.nu, defaultCostModel.nr)
@@ -41,7 +40,7 @@ class QuasistaticActionModel(crocoddyl.ActionModelAbstract):
             self.q_a_indices_ = delete_listb_from_lista(list(range(self.nx_ddp_)), self.q_u_indices_)
         else:
             self.has_ori = False
-            self.nx_ddp_ = self.nx_cqdc_
+            self.nx_ddp_ = self.nx_cqdc_      
 
     def set_wrist_pose(self, q_wrist):
         if self.num_wrist_joints == 0:

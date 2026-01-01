@@ -135,3 +135,155 @@ class ResidualModelFrameRotation(crocoddyl.ResidualModelAbstract):
             fJf = CalcNQdot2W(quat)
 
         data.Rx[:, self.xrot_slc_] = rJf @ fJf
+
+class ResidualModelManipulabilityTCI(crocoddyl.ResidualModelAbstract):
+    """
+    Fixed logic: 
+    1. Supports dynamic axis calculation by extracting object pose from x.
+    2. Implements proper Grasp Matrix logic.
+    """
+
+    def __init__(
+        self,
+        state,
+        nu: int,
+        pin_model,
+        tip_frame_ids: list,
+        sphere_center: np.ndarray,
+        hand_joint_slice,           # Slice for hand joints
+        object_pose_slice=None,     # [NEW] Slice for object pose (7 dim: pos+quat)
+        task_axis: np.ndarray = None,
+        epsilon: float = 1e-4
+    ):
+        crocoddyl.ResidualModelAbstract.__init__(self, state, 1, nu, True, True, True)
+        
+        # 1. Dependency Injection
+        self.pin_model = pin_model
+        self.pin_data = pin_model.createData() # Thread safety
+        
+        self.tip_frame_ids = tip_frame_ids
+        self.sphere_center = np.asarray(sphere_center).flatten()[:3]
+        
+        # 2. State Slicing
+        self.hand_slice = hand_joint_slice
+        self.object_slice = object_pose_slice # Needed for dynamic axis
+        
+        # 3. Task Configuration
+        if task_axis is not None:
+            self.task_axis = np.asarray(task_axis) / np.linalg.norm(task_axis)
+            self.use_fixed_axis = True
+        else:
+            self.task_axis = np.array([0., 0., 1.])
+            self.use_fixed_axis = False # Will use object_slice to compute axis
+            
+        self.target_rotation = None # Set via set_target_rotation
+        self.epsilon = epsilon
+
+    def set_target_rotation(self, target_quat):
+        """Set target quaternion [x,y,z,w] for dynamic axis"""
+        # Ensure input is pinocchio quaternion object
+        if isinstance(target_quat, (np.ndarray, list)):
+            # Assume input is [x,y,z,w] (Pinocchio convention)
+            self.target_rotation = pin.Quaternion(
+                target_quat[3], target_quat[0], target_quat[1], target_quat[2]
+            )
+        else:
+            self.target_rotation = target_quat
+        self.use_fixed_axis = False
+
+    def calc(self, data, x, u):
+        # 1. Update Hand Kinematics
+        q_hand = x[self.hand_slice]
+        pin.forwardKinematics(self.pin_model, self.pin_data, q_hand)
+        pin.computeJointJacobians(self.pin_model, self.pin_data, q_hand)
+        pin.updateFramePlacements(self.pin_model, self.pin_data)
+        
+        # 2. Determine Task Axis (The Object Twist Direction)
+        if self.use_fixed_axis or self.object_slice is None or self.target_rotation is None:
+            # Fallback to fixed axis
+            rot_axis = self.task_axis
+        else:
+            # [FIXED] Dynamic Axis Logic
+            # Extract object quaternion from state x
+            # Assuming object state is [px, py, pz, x, y, z, w]
+            obj_q_data = x[self.object_slice] 
+            # Pinocchio quat is [x,y,z,w], usually at end of 7-vec
+            curr_quat = pin.Quaternion(
+                obj_q_data[6], obj_q_data[3], obj_q_data[4], obj_q_data[5]
+            )
+            
+            # Compute Log(R_curr^T * R_target)
+            rot_err = pin.log3(curr_quat.conjugate() * self.target_rotation)
+            norm_err = np.linalg.norm(rot_err)
+            
+            if norm_err < 1e-4:
+                # Already at target, gradient is zero
+                data.r[0] = 0.0
+                return
+            
+            rot_axis = rot_err / norm_err
+
+        # 3. Compute TCI
+        total_tci = 0.0
+        
+        for fid in self.tip_frame_ids:
+            # A. Jacobian & Manipulability
+            J = pin.getFrameJacobian(
+                self.pin_model, self.pin_data, fid,
+                pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+            )[:3, :]
+            M = J @ J.T
+            
+            # B. Transposed Grasp Matrix Mapping (v_des = G^T * V_obj)
+            # V_obj = [0, w], so v_des = w x (p_tip - p_center)
+            tip_pos = self.pin_data.oMf[fid].translation
+            radius = tip_pos - self.sphere_center
+            
+            # [Math] This cross product is equivalent to G^T @ Twist
+            v_des = np.cross(rot_axis, radius)
+            
+            norm_v = np.linalg.norm(v_des)
+            if norm_v < 1e-6: continue
+            
+            u_tan = v_des / norm_v
+            
+            # C. Score
+            total_tci += u_tan.T @ M @ u_tan
+
+        # 4. Residual
+        data.r[0] = 1.0 / (total_tci + self.epsilon)
+
+    def calcDiff(self, data, x, u):
+        pass # Using NumDiff
+
+# ---------------------------------------------------------
+
+def create_tci_cost_from_params(state, actuation, options):
+    """Factory with NumDiff wrapper [FIXED]"""
+    if options.W_MANIP <= 0 or options.pin_model_manip is None:
+        return None
+        
+    # [FIXED] Pass object slice if available
+    # Assuming standard state: [object(7) + hand(nq)]
+    # You might need to adjust indices based on your exact state vector structure
+    obj_slice = slice(0, 7) if options.sphere_joint_idx == 0 else None
+    
+    residual = ResidualModelManipulabilityTCI(
+        state, actuation.nu,
+        options.pin_model_manip,
+        options.contact_frame_ids,
+        options.sphere_center,
+        options.hand_joint_slice,
+        object_pose_slice=obj_slice, # Pass this!
+        task_axis=None 
+    )
+    
+    # Set target if available
+    if options.target_rotation_manip is not None:
+        residual.set_target_rotation(options.target_rotation_manip)
+
+    # [FIXED] CRITICAL: Wrap with NumDiff!
+    residual_diff = crocoddyl.ResidualModelNumDiff(residual)
+    
+    cost = crocoddyl.CostModelResidual(state, residual_diff)
+    return cost

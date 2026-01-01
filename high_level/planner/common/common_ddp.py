@@ -43,7 +43,22 @@ class DDPSolverParams(object):
         # ----- for action model -----
         self.has_ori = False
         self.ori_start = 0
-        # ----------------------------
+        
+        # -----------------manipulability/TCI cost (Dependency Injection)-----------
+        # These fields should be set ONCE at optimizer initialization, NOT in cost loops.
+        # Usage:
+        #   1. Load model once: pin_model, _ = TCIHelper.load_allegro_hand_model()
+        #   2. Inject into params: options.pin_model_manip = pin_model
+        #   3. ResidualModel uses injected model (no file I/O in runtime)
+        self.W_MANIP = 0.0                  # weight for manipulability cost (0 = disabled)
+        self.pin_model_manip = None         # Pinocchio model (injected, loaded once)
+        self.pin_data_manip = None          # Pinocchio data (optional, ResidualModel creates its own)
+        self.contact_frame_ids = []         # fingertip frame IDs (pre-resolved at init)
+        self.object_frame_id = None         # object frame ID (if needed)
+        self.sphere_center = None           # fixed sphere center position (3,) for rotation tasks
+        self.hand_joint_slice = None        # slice or indices of hand joints in state vector
+        self.target_rotation_manip = None   # target rotation for TCI (3x3 matrix or quaternion)
+        # ------------------------------------------------------------------------------
         
         self.q_wrist_indices = []                       # indices of wrist joints in x0
 

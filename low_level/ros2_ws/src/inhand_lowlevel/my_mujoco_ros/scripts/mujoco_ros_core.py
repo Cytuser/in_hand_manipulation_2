@@ -426,6 +426,30 @@ class MuJoCoSimulatorNode(Node):
 
         return geom_names
 
+    def get_active_contacts_map(self):
+        """
+        [优化] 遍历一次接触列表，建立 {指尖GeomID: Contact数据} 的哈希表。
+        这比返回名字列表高效得多，主函数可以直接通过 ID 取数据。
+        """
+        contacts_map = {}
+        target_finger_ids = set(self.contact_geom_ids) # 转为集合，查找更快
+        # print(f"target_finger_ids: {target_finger_ids}")
+        # target_finger_ids: {37, 11, 21, 31}
+        obj_id = self.object_geom_id
+
+        for k in range(self.data.ncon):
+            contact = self.data.contact[k]
+            g1, g2 = contact.geom[0], contact.geom[1]
+
+            # 检查是否是 [指尖 <-> 物体] 的接触
+            if g1 in target_finger_ids and g2 == obj_id:
+                contacts_map[g1] = contact
+            elif g2 in target_finger_ids and g1 == obj_id:
+                contacts_map[g2] = contact
+                
+        return contacts_map
+    
+
     def publish_contact_states(self):
         """ Returned contact points and forces are in the world frame """
 
@@ -551,82 +575,192 @@ class MuJoCoSimulatorNode(Node):
 
         self.contact_state_pub.publish(contact_info_msg)
 
-
     def compute_and_publish_manipulability_m(self):
         """
-        计算并发布可操作性椭球核心矩阵 M = J_rot @ J_rot.T
-        其中 J_rot 是从关节速度到球体角速度的映射
+        计算并发布可操作性椭球核心矩阵 M
+        [优化点]: 使用 Map 结构 O(1) 获取接触信息，代码逻辑大幅精简。
         """
         try:
-            # 1. 获取基础数据
-            # ---------------------------------------------------------
-            obj_pos = self.data.xpos[self.object_body_indice] # 球心位置
-            # print(f"obj_pos: {obj_pos}")
-            nc = len(self.contact_geom_ids) # 接触点数量
-            # print(f"nc: {nc}")
+            # --- 1. 准备基础数据 ---
+            obj_pos = self.data.xpos[self.object_body_indice]
+            nc = len(self.contact_geom_ids)
+            nv_hand = len(self.qvel_indices)
             if nc == 0: return
 
-            # # 手部关节数量 (从 qvel_indices 获取)
-            nv_hand = len(self.qvel_indices) 
-            # print(f"nv_hand: {nv_hand}")
-            # # 2. 初始化矩阵 (HF模型: 每个接触点 3 行约束)
-            # # ---------------------------------------------------------
-            # # G_rot_T: (3*nc, 3) -> 球体角速度 w_obj 到 接触点线速度 v_c 的映射
+            # 预分配矩阵内存
             G_rot_T = np.zeros((3 * nc, 3))
-            # # J_hand:  (3*nc, nv_hand) -> 关节速度 dq 到 接触点线速度 v_c 的映射
             J_hand = np.zeros((3 * nc, nv_hand))
-            
-            # # 临时缓冲区
-            jacp = np.zeros((3, self.model.nv)) # 线速度雅可比
-            jacr = np.zeros((3, self.model.nv)) # 角速度雅可比 (忽略)
+            jacp = np.zeros((3, self.model.nv))
+            jacr = np.zeros((3, self.model.nv))
 
-            # # 3. 填充 G 和 J
-            # # ---------------------------------------------------------
+            # --- 2. [关键优化] 获取接触字典 ---
+            # 直接拿到 {geom_id: contact}，无需循环查找名字或索引
+            contacts_map = self.get_active_contacts_map()
+            # print(f"contacts_map: {contacts_map}")
+            # print("contact_site_ids: ", self.contact_site_ids)
+            # --- 3. 核心循环 ---
             for i, site_id in enumerate(self.contact_site_ids):
-                # 获取接触点位置
+                # 当前手指预期的 geom id
+                target_gid = self.contact_geom_ids[i]
+                
+                # A. 确定接触点位置 (World Frame)
+                # ---------------------------------------------------
+                # 默认策略: 使用 Site 中心
                 site_pos = self.data.site_xpos[site_id]
-                # print(f"site_pos: {site_pos}")
-                # A. 填充 G_rot_T
-                # 公式: v_c = v_obj + w_obj x r
-                # 固定球体 v_obj=0, r = p_contact - p_center
-                # v_c = -r x w_obj = -skew(r) * w_obj
-                r = site_pos - obj_pos
+                contact_point_world = site_pos.copy()
+
+                # 优化策略: 如果字典里有这个 ID，说明发生了真实接触
+                if target_gid in contacts_map:
+                    contact = contacts_map[target_gid]
+                    
+                    # 提取精确接触点，并根据法线微调表面位置
+                    # (MuJoCo的contact.pos位于穿透深度中间，我们需要表面点)
+                    offset_dir = 1.0 if contact.geom[0] == target_gid else -1.0
+                    contact_point_world = contact.pos + offset_dir * 0.5 * contact.dist * contact.frame[:3]
+
+                # B. 填充 Grasp Matrix (G_rot_T)
+                # ---------------------------------------------------
+                r = contact_point_world - obj_pos
                 
-                row_start = 3 * i
-                row_end = 3 * i + 3
-                
+                row_start, row_end = 3 * i, 3 * (i + 1)
                 G_rot_T[row_start:row_end, :] = -skew_matrix(r)
+
+                # C. 填充 Jacobian (J_hand)
+                # ---------------------------------------------------
+                # 获取 Site 所在的刚体 ID
+                finger_body_id = self.model.site_bodyid[site_id]
+                # print(f"finger_body_id: {finger_body_id}")
+
+                # finger_body_id: 6
+                # finger_body_id: 11
+                # finger_body_id: 16
+                # finger_body_id: 21
                 
-                # B. 填充 J_hand
-                mujoco.mj_jacSite(self.model, self.data, jacp, jacr, site_id)
-                # 切片提取手部关节部分
+                # 使用 mj_jac 计算基于真实接触点的雅可比 (自动包含力臂 offset)
+                mujoco.mj_jac(self.model, self.data, jacp, jacr, contact_point_world, finger_body_id)
+                
+                # 填入矩阵
                 J_hand[row_start:row_end, :] = jacp[:, self.qvel_indices]
 
-            # 4. 计算合成雅可比 J_rot
-            # ---------------------------------------------------------
-            # 关系: G_rot_T * w_obj = J_hand * dq
-            # w_obj = pinv(G_rot_T) * J_hand * dq
-            # J_rot = pinv(G_rot_T) * J_hand
+            # --- 4. 矩阵运算与发布 ---
+            # W_inv * J (使用伪逆处理奇异)
+            J_rot = np.linalg.pinv(G_rot_T) @ J_hand
             
-            # 使用伪逆求解 (处理接触点不足或奇异情况)
-            G_pinv = np.linalg.pinv(G_rot_T)
-            J_rot = G_pinv @ J_hand # 形状 (3, nv_hand)
-
-            # 5. 计算核心矩阵 M
-            # ---------------------------------------------------------
-            # M = J J^T (3x3 对称矩阵)
+            # M = J * J.T
             M = J_rot @ J_rot.T
-            # print(f"M: {M}")
-            # 6. 发布消息
-            # ---------------------------------------------------------
+
             msg = Float64MultiArray()
-            # 展平为 9 个元素的数组发布
             msg.data = M.flatten().tolist()
             self.manipulability_m_pub.publish(msg)
 
         except Exception as e:
-            # self.get_logger().warn(f"Failed to compute M: {e}")
+            # self.get_logger().warn(f"Compute M Error: {e}")
             pass
+    
+
+    # def compute_and_publish_manipulability_m(self):
+    #     """
+    #     计算并发布可操作性椭球核心矩阵 M = J_rot @ J_rot.T
+    #     其中 J_rot 是从关节速度到球体角速度的映射
+    #     """
+    #     try:
+    #         # 1. 获取基础数据
+    #         # ---------------------------------------------------------
+    #         obj_pos = self.data.xpos[self.object_body_indice] # 球心位置
+    #         # print(f"obj_pos: {obj_pos}")
+    #         nc = len(self.contact_geom_ids) # 接触点数量
+    #         # print(f"nc: {nc}")
+    #         if nc == 0: return
+
+    #         # # 手部关节数量 (从 qvel_indices 获取)
+    #         nv_hand = len(self.qvel_indices) 
+    #         # print(f"nv_hand: {nv_hand}")
+    #         # # 2. 初始化矩阵 (HF模型: 每个接触点 3 行约束)
+    #         # # ---------------------------------------------------------
+    #         # # G_rot_T: (3*nc, 3) -> 球体角速度 w_obj 到 接触点线速度 v_c 的映射
+    #         G_rot_T = np.zeros((3 * nc, 3))
+    #         # # J_hand:  (3*nc, nv_hand) -> 关节速度 dq 到 接触点线速度 v_c 的映射
+    #         J_hand = np.zeros((3 * nc, nv_hand))
+            
+    #         # # 临时缓冲区
+    #         jacp = np.zeros((3, self.model.nv)) # 线速度雅可比
+    #         jacr = np.zeros((3, self.model.nv)) # 角速度雅可比 (忽略)
+
+    #         # # 3. 获取当前接触信息
+    #         # # ---------------------------------------------------------
+    #         current_contact_geom_names = self.get_contact_geom_names()
+            
+    #         # # 4. 填充 G 和 J
+    #         # # ---------------------------------------------------------
+    #         for i, site_id in enumerate(self.contact_site_ids):
+    #             contact_name = self.geom_to_name_map[self.contact_geom_ids[i]]
+                
+    #             # 初始化为 site 位置（世界坐标系）
+    #             site_pos = self.data.site_xpos[site_id]
+    #             contact_point_on_finger_world = site_pos.copy()
+                
+    #             # 如果有实际接触，使用真实的接触点位置（世界坐标系）
+    #             if contact_name in current_contact_geom_names:
+    #                 index = current_contact_geom_names.index(contact_name)
+    #                 contact = self.data.contact[index]
+                    
+    #                 geom1 = contact.geom[0]
+    #                 geom2 = contact.geom[1]
+                    
+    #                 # 计算接触点位置（世界坐标系）
+    #                 contact_point = contact.pos
+    #                 contact_normal = normalize(contact.frame[:3])
+    #                 contact_dist = contact.dist
+    #                 contact_point_on_geom1 = contact_point + 0.5 * contact_dist * contact_normal
+    #                 contact_point_on_geom2 = contact_point - 0.5 * contact_dist * contact_normal
+                    
+    #                 if geom1 in self.contact_geom_ids:
+    #                     contact_point_on_finger_world = contact_point_on_geom1
+    #                 elif geom2 in self.contact_geom_ids:
+    #                     contact_point_on_finger_world = contact_point_on_geom2
+                
+    #             # A. 填充 G_rot_T
+    #             # 公式: v_c = v_obj + w_obj x r
+    #             # 固定球体 v_obj=0, r = p_contact - p_center
+    #             # v_c = -r x w_obj = -skew(r) * w_obj
+    #             # r 是从物体中心到接触点的向量（世界坐标系）
+    #             r = contact_point_on_finger_world - obj_pos
+                
+    #             row_start = 3 * i
+    #             row_end = 3 * i + 3
+                
+    #             G_rot_T[row_start:row_end, :] = -skew_matrix(r)
+                
+    #             # B. 填充 J_hand
+    #             mujoco.mj_jacSite(self.model, self.data, jacp, jacr, site_id)
+    #             # 切片提取手部关节部分
+    #             J_hand[row_start:row_end, :] = jacp[:, self.qvel_indices]
+
+    #         # 5. 计算合成雅可比 J_rot
+    #         # ---------------------------------------------------------
+    #         # 关系: G_rot_T * w_obj = J_hand * dq
+    #         # w_obj = pinv(G_rot_T) * J_hand * dq
+    #         # J_rot = pinv(G_rot_T) * J_hand
+            
+    #         # 使用伪逆求解 (处理接触点不足或奇异情况)
+    #         G_pinv = np.linalg.pinv(G_rot_T)
+    #         J_rot = G_pinv @ J_hand # 形状 (3, nv_hand)
+
+    #         # 6. 计算核心矩阵 M
+    #         # ---------------------------------------------------------
+    #         # M = J J^T (3x3 对称矩阵)
+    #         M = J_rot @ J_rot.T
+    #         # print(f"M: {M}")
+    #         # 7. 发布消息
+    #         # ---------------------------------------------------------
+    #         msg = Float64MultiArray()
+    #         # 展平为 9 个元素的数组发布
+    #         msg.data = M.flatten().tolist()
+    #         self.manipulability_m_pub.publish(msg)
+
+    #     except Exception as e:
+    #         # self.get_logger().warn(f"Failed to compute M: {e}")
+    #         pass
     def set_desired_joint_pos_callback(self, msg:JointState):
         def get_jnt_remap(rec_jnt, des_jnt):
             """ Get the mapping from rec_jnt to des_jnt """

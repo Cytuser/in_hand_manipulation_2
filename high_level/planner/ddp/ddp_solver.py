@@ -6,7 +6,12 @@ from pydrake.all import (
 from qsim_cpp import QuasistaticSimulatorCpp
 from qsim_cpp import ForwardDynamicsMode
 from ddp.action_model import QuasistaticActionModel
-from ddp.residual_model import ResidualModelPairCollision, ResidualModelFrameRotation
+# [MODIFIED] Added create_tci_cost_from_params import for TCI/Manipulability cost
+from ddp.residual_model import (
+    ResidualModelPairCollision, 
+    ResidualModelFrameRotation,
+    create_tci_cost_from_params
+)
 from common.common_ddp import DDPSolverParams, convert_array_to_list, convert_quat_to_matrix, normalize_array
 
 
@@ -130,6 +135,7 @@ def generate_one_step_cost_model(
         )
         costModel.addCost("jointLimits", costJointLimits, options.W_J)
 
+    # print("options.enable_sc_cost: #############", options.enable_sc_cost)
     # self collision cost
     if options.enable_sc_cost:
         pin_model = options.models_sc[0]
@@ -143,6 +149,18 @@ def generate_one_step_cost_model(
             )
         )
         costModel.addCost("selfCollide", costSelfCollide, options.W_SC)
+
+    # [MODIFIED] Manipulability/TCI Cost Injection (Plugin Architecture)
+    # Only add to running cost (not terminal) and if enabled via W_MANIP > 0
+    # The factory function handles dependency injection from options:
+    #   - options.pin_model_manip: Pinocchio model (loaded once at optimizer init)
+    #   - options.contact_frame_ids: Pre-resolved fingertip frame IDs
+    #   - options.sphere_center: Fixed sphere center position
+    #   - options.hand_joint_slice: Hand joint indices in state
+    if not is_terminal and options.W_MANIP > 0:
+        tci_cost = create_tci_cost_from_params(state, actuation, options)
+        if tci_cost is not None:
+            costModel.addCost("manipulability", tci_cost, options.W_MANIP)
 
     if not is_terminal:
         costControl = crocoddyl.CostModelResidual(
